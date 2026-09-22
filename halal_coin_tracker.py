@@ -2,14 +2,26 @@
 """
 Halal Coin Tracker — Binance live price tracker
 
-Fetches live entry price at start, then tracks price movement against that
-entry (live "exit" price = current price at each refresh), computing % and
-$ gain/loss on a hypothetical $1,000 position.
+Two ways to run this:
 
-USAGE:
-    python halal_coin_tracker.py --once          # single snapshot, then exit
-    python halal_coin_tracker.py --loop           # refresh every 15 min until Ctrl+C
-    python halal_coin_tracker.py                  # prompts you to pick a mode
+1. LOCAL / INTERACTIVE (on your own machine):
+    python halal_coin_tracker.py --once      # single snapshot, then exit
+    python halal_coin_tracker.py --loop      # refresh every 15 min until Ctrl+C
+    python halal_coin_tracker.py             # prompts you to pick a mode
+
+2. CI / SCHEDULED (e.g. GitHub Actions, cron):
+   Each scheduled run is a fresh process — it can't just "stay open" for 15
+   minutes like --loop does locally. So --ci mode instead PERSISTS the entry
+   price to a small JSON file (entry_state.json by default). The first run
+   fetches and locks in entry prices; every run after that reads the same
+   entry prices back and compares against the live "exit" price, so the
+   gain/loss stays anchored to that original entry across runs.
+
+    python halal_coin_tracker.py --ci                 # normal scheduled run
+    python halal_coin_tracker.py --ci --reset-entry    # start a fresh entry point
+
+   --ci also appends every run's results to a CSV log (results_log.csv by
+   default) so you get a running history, not just the latest snapshot.
 
 SETUP:
     1. pip install requests
@@ -24,6 +36,8 @@ SETUP:
 
 import os
 import sys
+import csv
+import json
 import time
 import argparse
 from datetime import datetime
@@ -44,6 +58,10 @@ POSITION_SIZE_USD = 1000
 
 # Refresh interval for --loop mode, in seconds (15 minutes)
 REFRESH_SECONDS = 15 * 60
+
+# Default file paths for --ci (scheduled/GitHub Actions) mode
+STATE_FILE_DEFAULT = "entry_state.json"
+LOG_FILE_DEFAULT = "results_log.csv"
 
 # Coins to track: Binance symbol -> (display name, halal/haram/unknown, business model note)
 # Sourced from Saima's "Safe Trading Universe" (project file, liquidity tier 6+,
@@ -220,13 +238,95 @@ def run_loop(entry_prices: dict):
         sys.exit(0)
 
 
+# ── CI / SCHEDULED MODE (e.g. GitHub Actions) ───────────────────────────
+
+def load_entry_state(state_file: str):
+    """Return the saved entry-price dict, or None if no state file exists yet."""
+    if not os.path.exists(state_file):
+        return None
+    with open(state_file, "r") as f:
+        data = json.load(f)
+    # Only trust symbols we still track; drop anything stale/removed
+    return {sym: price for sym, price in data.items() if sym in COINS}
+
+
+def save_entry_state(state_file: str, entry_prices: dict):
+    with open(state_file, "w") as f:
+        json.dump(entry_prices, f, indent=2)
+
+
+def append_csv_log(log_file: str, rows: list, timestamp: str):
+    file_exists = os.path.exists(log_file)
+    with open(log_file, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(
+                ["timestamp", "coin", "label", "entry_price", "exit_price",
+                 "gain_pct", "loss_pct", "dollar_change_on_1000"]
+            )
+        for r in rows:
+            writer.writerow([
+                timestamp,
+                r["coin"],
+                r["label"],
+                f"{r['entry_price']:.6f}",
+                f"{r['exit_price']:.6f}",
+                f"{r['gain_pct']:.2f}" if r["gain_pct"] is not None else "",
+                f"{r['loss_pct']:.2f}" if r["loss_pct"] is not None else "",
+                f"{r['dollar_change']:.2f}",
+            ])
+
+
+def run_ci(state_file: str, log_file: str, reset_entry: bool):
+    """One scheduled run: load or create entry prices, fetch live exit prices,
+    print the table, and append the results to the CSV log."""
+    entry_prices = None if reset_entry else load_entry_state(state_file)
+
+    if entry_prices is None:
+        print("No existing entry state found (or --reset-entry used) — "
+              "fetching fresh entry prices and locking them in.")
+        entry_prices = fetch_entry_prices()
+        save_entry_state(state_file, entry_prices)
+    else:
+        print(f"Loaded entry prices from {state_file} (set previously).")
+        # Drop any tracked coin whose symbol turned out invalid this run
+        for symbol in list(COINS.keys()):
+            if symbol not in entry_prices:
+                pass  # covered by fetch_entry_prices' own skip-logic on future resets
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\nSnapshot at {timestamp}")
+    rows = []
+    for symbol, entry_price in entry_prices.items():
+        if symbol not in COINS:
+            continue
+        try:
+            exit_price = fetch_price(symbol)
+        except requests.exceptions.HTTPError:
+            print(f"  WARNING: couldn't fetch '{symbol}' this run — skipping.")
+            continue
+        rows.append(compute_row(symbol, entry_price, exit_price))
+
+    print_table(rows)
+    append_csv_log(log_file, rows, timestamp)
+    print(f"\nAppended {len(rows)} row(s) to {log_file}")
+
+
 # ── ENTRY POINT ──────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Halal Coin Tracker")
     parser.add_argument("--once", action="store_true", help="Run a single snapshot and exit")
-    parser.add_argument("--loop", action="store_true", help="Refresh every 15 minutes until stopped")
+    parser.add_argument("--loop", action="store_true", help="Refresh every 15 minutes until stopped (local use)")
+    parser.add_argument("--ci", action="store_true", help="Scheduled/CI mode — persists entry price to a state file (GitHub Actions, cron)")
+    parser.add_argument("--reset-entry", action="store_true", help="With --ci: discard saved entry prices and lock in fresh ones now")
+    parser.add_argument("--state-file", default=STATE_FILE_DEFAULT, help="With --ci: path to the entry-price state JSON file")
+    parser.add_argument("--log-file", default=LOG_FILE_DEFAULT, help="With --ci: path to the CSV results log")
     args = parser.parse_args()
+
+    if args.ci:
+        run_ci(args.state_file, args.log_file, args.reset_entry)
+        return
 
     mode = None
     if args.once:
