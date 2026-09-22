@@ -1,0 +1,37 @@
+name: Halal Coin Tracker
+
+on:
+  schedule:
+    # GitHub's scheduler is best-effort, not exact-to-the-second — during
+    # high load it can run a few minutes late. Fine for a 15-min tracker.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit entry_state.json / results_log.csv back
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run tracker
+        run: python halal_coin_tracker.py --ci
+
+      - name: Commit updated state and log
+        run: |
+          git config user.name "halal-coin-tracker-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add entry_state.json results_log.csv
+          git diff --cached --quiet || git commit -m "Update tracker snapshot [skip ci]"
+          git push
